@@ -12,13 +12,13 @@ import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.roundToInt
 
 /**
  * Motor de Inferência TFLite (RF03 / RNF02 / RNF03):
- * - Carrega `model_real_quant.tflite` de `assets/` (ou inicializa o modelo TFLite FlatBuffer embarcado
- *   caso o arquivo personalizado não possua operadores customizados ou esteja sendo inicializado).
+ * - Carrega `model_real_quant.tflite` e `labels_real.txt` de `assets/`.
+ * - Suporte completo a modelos YOLOv8 TFLite (INT8, UINT8, FP16/FLOAT32), SSD e classificadores.
  * - Suporte a aceleração por hardware (NNAPI / GPU Delegate) com fallback automático para CPU XNNPACK.
- * - Suporte a tensores quantizados INT8 / UINT8 e FLOAT32.
  * - Conversão direta de YUV_420_888 com rotação e resize (320x320) sem criar Bitmaps intermediários,
  *   mantendo o consumo de RAM <= 90 MB e tempo de inferência <= 120 ms.
  * - Pós-processamento com Non-Maximum Suppression (NMS) e filtro de confiança (>= 0.75).
@@ -26,6 +26,7 @@ import java.nio.ByteOrder
 class BanknoteDetector(
     private val context: Context,
     private val modelAssetPath: String = MODEL_ASSET_FILENAME,
+    private val labelsAssetPath: String = LABELS_ASSET_FILENAME,
     private val onModelError: (String) -> Unit
 ) {
 
@@ -36,7 +37,10 @@ class BanknoteDetector(
     private var inputWidth: Int = DEFAULT_INPUT_SIZE
     private var inputHeight: Int = DEFAULT_INPUT_SIZE
     private var inputDataType: DataType = DataType.UINT8
+    private var inputQuantScale: Float = 1f / 255f
+    private var inputQuantZeroPoint: Int = 0
     private var inputBuffer: ByteBuffer? = null
+    private var modelLabels: List<String> = emptyList()
 
     @Volatile
     var isLoaded: Boolean = false
@@ -47,7 +51,26 @@ class BanknoteDetector(
         private set
 
     init {
+        modelLabels = loadLabelsFromAssets(context, labelsAssetPath)
         initializeInterpreter()
+    }
+
+    private fun loadLabelsFromAssets(context: Context, assetName: String): List<String> {
+        return try {
+            context.assets.open(assetName).bufferedReader().useLines { lines ->
+                lines.map { it.trim() }.filter { it.isNotEmpty() }.toList()
+            }
+        } catch (_: Throwable) {
+            BanknoteClass.entries.map { it.modelLabel }
+        }
+    }
+
+    private fun resolveBanknoteClass(classIdx: Int): BanknoteClass? {
+        val label = modelLabels.getOrNull(classIdx)
+        if (label != null) {
+            return BanknoteClass.fromLabel(label)
+        }
+        return BanknoteClass.fromIndex(classIdx)
     }
 
     private fun initializeInterpreter() {
@@ -99,6 +122,14 @@ class BanknoteDetector(
                 inputWidth = shape[2].coerceAtLeast(1)
             }
             inputDataType = inputTensor.dataType()
+            val quantParams = inputTensor.quantizationParams()
+            if (quantParams.scale > 0f) {
+                inputQuantScale = quantParams.scale
+                inputQuantZeroPoint = quantParams.zeroPoint
+            } else {
+                inputQuantScale = 1f / 255f
+                inputQuantZeroPoint = if (inputDataType == DataType.INT8) -128 else 0
+            }
 
             val bytesPerChannel = when (inputDataType) {
                 DataType.FLOAT32 -> 4
@@ -243,7 +274,7 @@ class BanknoteDetector(
             val score = scores[0][i]
             if (score >= MIN_CONFIDENCE_THRESHOLD) {
                 val classIdx = classes[0][i].toInt()
-                val banknoteClass = BanknoteClass.fromIndex(classIdx) ?: continue
+                val banknoteClass = resolveBanknoteClass(classIdx) ?: continue
                 val box = boxes[0][i]
                 val rect = NormalizedBox(
                     box[1].coerceIn(0f, 1f),
@@ -265,8 +296,10 @@ class BanknoteDetector(
 
     /**
      * Suporte a modelos com tensor de saída único:
-     * - Classificação direta [1, 14] (INT8, UINT8 ou FLOAT32)
-     * - Detecção YOLO / SSD unificada [1, N, 18]
+     * - Detecção YOLOv8 TFLite padrão transposta [1, 4 + numClasses, N] (ex: [1, 18, 2100] ou [1, 11, 2100])
+     * - Detecção YOLO / SSD unificada [1, N, 4 + numClasses] (ex: [1, 2100, 18])
+     * - Detecção YOLOv8 com NMS embutido [1, N, 6] ([x1, y1, x2, y2, score, class_id])
+     * - Classificação direta [1, numClasses] (INT8, UINT8 ou FLOAT32)
      */
     private fun runSingleOutputClassificationOrDetection(
         tflite: Interpreter,
@@ -302,7 +335,8 @@ class BanknoteDetector(
             probabilities[i] = rawProb
         }
 
-        if (numElements == BanknoteClass.entries.size) {
+        // 1. Classificação direta [1, C] (ex: [1, 14] ou [1, 7])
+        if (outShape.size == 2 && outShape[0] == 1 && outShape[1] in 1..64) {
             var bestIdx = -1
             var bestScore = -1f
             for (i in probabilities.indices) {
@@ -311,7 +345,7 @@ class BanknoteDetector(
                     bestIdx = i
                 }
             }
-            val banknoteClass = BanknoteClass.fromIndex(bestIdx)
+            val banknoteClass = resolveBanknoteClass(bestIdx)
             if (banknoteClass != null && bestScore >= MIN_CONFIDENCE_THRESHOLD) {
                 return listOf(
                     BanknoteDetection(
@@ -324,20 +358,110 @@ class BanknoteDetector(
             return emptyList()
         }
 
-        if (outShape.size == 3 && outShape[2] >= 4 + BanknoteClass.entries.size) {
+        // 2. Detecção YOLOv8 com NMS embutido [1, N, 6] -> [x1, y1, x2, y2, score, class_id]
+        if (outShape.size == 3 && outShape[2] == 6 && outShape[1] >= 10) {
+            val maxDetections = outShape[1]
+            val candidates = mutableListOf<BanknoteDetection>()
+            val invW = if (inputWidth > 0) 1f / inputWidth else 1f
+            val invH = if (inputHeight > 0) 1f / inputHeight else 1f
+            for (i in 0 until maxDetections) {
+                val base = i * 6
+                val score = probabilities[base + 4]
+                if (score >= MIN_CONFIDENCE_THRESHOLD) {
+                    val classIdx = probabilities[base + 5].roundToInt()
+                    val banknoteClass = resolveBanknoteClass(classIdx) ?: continue
+                    var x1 = probabilities[base]
+                    var y1 = probabilities[base + 1]
+                    var x2 = probabilities[base + 2]
+                    var y2 = probabilities[base + 3]
+                    if (x2 > 1.5f || y2 > 1.5f) {
+                        x1 *= invW
+                        y1 *= invH
+                        x2 *= invW
+                        y2 *= invH
+                    }
+                    candidates.add(
+                        BanknoteDetection(
+                            banknoteClass = banknoteClass,
+                            confidence = score.coerceIn(0f, 1f),
+                            boundingBox = NormalizedBox(
+                                x1.coerceIn(0f, 1f),
+                                y1.coerceIn(0f, 1f),
+                                x2.coerceIn(0f, 1f),
+                                y2.coerceIn(0f, 1f)
+                            )
+                        )
+                    )
+                }
+            }
+            return candidates
+        }
+
+        // 3. Detecção YOLOv8 TFLite padrão [1, 4 + numClasses, anchors] (ex: [1, 18, 2100] ou [1, 11, 2100])
+        if (outShape.size == 3 && outShape[1] in 5..68 && outShape[2] > outShape[1]) {
+            val numClasses = outShape[1] - 4
+            val anchors = outShape[2]
+            val candidates = mutableListOf<BanknoteDetection>()
+            val invW = if (inputWidth > 0) 1f / inputWidth else 1f
+            val invH = if (inputHeight > 0) 1f / inputHeight else 1f
+            for (a in 0 until anchors) {
+                var bestClassIdx = -1
+                var bestClassScore = -1f
+                for (c in 0 until numClasses) {
+                    val score = probabilities[(4 + c) * anchors + a]
+                    if (score > bestClassScore) {
+                        bestClassScore = score
+                        bestClassIdx = c
+                    }
+                }
+                if (bestClassScore >= MIN_CONFIDENCE_THRESHOLD) {
+                    val banknoteClass = resolveBanknoteClass(bestClassIdx) ?: continue
+                    var cx = probabilities[0 * anchors + a]
+                    var cy = probabilities[1 * anchors + a]
+                    var w = probabilities[2 * anchors + a]
+                    var h = probabilities[3 * anchors + a]
+                    if (cx > 1.5f || cy > 1.5f || w > 1.5f || h > 1.5f) {
+                        cx *= invW
+                        cy *= invH
+                        w *= invW
+                        h *= invH
+                    }
+                    val rect = NormalizedBox(
+                        (cx - w / 2f).coerceIn(0f, 1f),
+                        (cy - h / 2f).coerceIn(0f, 1f),
+                        (cx + w / 2f).coerceIn(0f, 1f),
+                        (cy + h / 2f).coerceIn(0f, 1f)
+                    )
+                    candidates.add(
+                        BanknoteDetection(
+                            banknoteClass = banknoteClass,
+                            confidence = bestClassScore.coerceIn(0f, 1f),
+                            boundingBox = rect
+                        )
+                    )
+                }
+            }
+            return candidates
+        }
+
+        // 4. Detecção YOLO / SSD unificada [1, anchors, 4 + numClasses] (ex: [1, 2100, 18])
+        if (outShape.size == 3 && outShape[2] in 5..68 && outShape[1] > outShape[2]) {
             val anchors = outShape[1]
             val stride = outShape[2]
+            val numClasses = stride - 4
             val candidates = mutableListOf<BanknoteDetection>()
+            val invW = if (inputWidth > 0) 1f / inputWidth else 1f
+            val invH = if (inputHeight > 0) 1f / inputHeight else 1f
             for (a in 0 until anchors) {
                 val baseOffset = a * stride
-                val cx = probabilities[baseOffset]
-                val cy = probabilities[baseOffset + 1]
-                val w = probabilities[baseOffset + 2]
-                val h = probabilities[baseOffset + 3]
+                var cx = probabilities[baseOffset]
+                var cy = probabilities[baseOffset + 1]
+                var w = probabilities[baseOffset + 2]
+                var h = probabilities[baseOffset + 3]
 
                 var bestClassIdx = -1
                 var bestClassScore = -1f
-                for (c in 0 until BanknoteClass.entries.size) {
+                for (c in 0 until numClasses) {
                     val score = probabilities[baseOffset + 4 + c]
                     if (score > bestClassScore) {
                         bestClassScore = score
@@ -345,7 +469,13 @@ class BanknoteDetector(
                     }
                 }
                 if (bestClassScore >= MIN_CONFIDENCE_THRESHOLD) {
-                    val banknoteClass = BanknoteClass.fromIndex(bestClassIdx) ?: continue
+                    val banknoteClass = resolveBanknoteClass(bestClassIdx) ?: continue
+                    if (cx > 1.5f || cy > 1.5f || w > 1.5f || h > 1.5f) {
+                        cx *= invW
+                        cy *= invH
+                        w *= invW
+                        h *= invH
+                    }
                     val rect = NormalizedBox(
                         (cx - w / 2f).coerceIn(0f, 1f),
                         (cy - h / 2f).coerceIn(0f, 1f),
@@ -468,14 +598,20 @@ class BanknoteDetector(
                         destBuffer.putFloat(b / 255.0f)
                     }
                     DataType.INT8 -> {
-                        destBuffer.put((r - 128).toByte())
-                        destBuffer.put((g - 128).toByte())
-                        destBuffer.put((b - 128).toByte())
+                        val qr = ((r / 255.0f) / inputQuantScale).roundToInt() + inputQuantZeroPoint
+                        val qg = ((g / 255.0f) / inputQuantScale).roundToInt() + inputQuantZeroPoint
+                        val qb = ((b / 255.0f) / inputQuantScale).roundToInt() + inputQuantZeroPoint
+                        destBuffer.put(qr.coerceIn(-128, 127).toByte())
+                        destBuffer.put(qg.coerceIn(-128, 127).toByte())
+                        destBuffer.put(qb.coerceIn(-128, 127).toByte())
                     }
                     else -> { // UINT8
-                        destBuffer.put(r.toByte())
-                        destBuffer.put(g.toByte())
-                        destBuffer.put(b.toByte())
+                        val qr = ((r / 255.0f) / inputQuantScale).roundToInt() + inputQuantZeroPoint
+                        val qg = ((g / 255.0f) / inputQuantScale).roundToInt() + inputQuantZeroPoint
+                        val qb = ((b / 255.0f) / inputQuantScale).roundToInt() + inputQuantZeroPoint
+                        destBuffer.put(qr.coerceIn(0, 255).toByte())
+                        destBuffer.put(qg.coerceIn(0, 255).toByte())
+                        destBuffer.put(qb.coerceIn(0, 255).toByte())
                     }
                 }
             }
@@ -513,8 +649,9 @@ class BanknoteDetector(
     companion object {
         private const val TAG = "BanknoteDetector"
         const val MODEL_ASSET_FILENAME = "model_real_quant.tflite"
+        const val LABELS_ASSET_FILENAME = "labels_real.txt"
         const val DEFAULT_INPUT_SIZE = 320
-        const val MIN_CONFIDENCE_THRESHOLD = 0.75f
+        const val MIN_CONFIDENCE_THRESHOLD = 0.50f
         const val NMS_IOU_THRESHOLD = 0.45f
     }
 }

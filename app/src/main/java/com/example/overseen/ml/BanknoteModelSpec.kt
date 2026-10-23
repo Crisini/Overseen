@@ -1,9 +1,10 @@
 package com.example.overseen.ml
 
-import android.graphics.RectF
+import java.util.Locale
 
 /**
- * RF03.2: As 14 classes oficiais de cédulas de Real brasileiro (1ª e 2ª famílias).
+ * RF03.2: As 14 classes oficiais de cédulas de Real brasileiro (1ª e 2ª famílias)
+ * + 4 classes de moedas de centavos presentes no dataset brasileiro.
  * RF04.4: Frases ultra-curtas para síntese concisa de voz (TTS).
  */
 enum class BanknoteClass(
@@ -28,14 +29,62 @@ enum class BanknoteClass(
     REAIS_20_NOVA(10, "20_reais_nova", "20 reais, nova", "R$ 20 (2ª Família)"),
     REAIS_50_NOVA(11, "50_reais_nova", "50 reais, nova", "R$ 50 (2ª Família)"),
     REAIS_100_NOVA(12, "100_reais_nova", "100 reais, nova", "R$ 100 (2ª Família)"),
-    REAIS_200_NOVA(13, "200_reais_nova", "200 reais, nova", "R$ 200 (2ª Família)");
+    REAIS_200_NOVA(13, "200_reais_nova", "200 reais, nova", "R$ 200 (2ª Família)"),
+
+    // Moedas (centavos)
+    CENTAVOS_5(14, "5_cents", "5 centavos", "R$ 0,05 (Moeda)"),
+    CENTAVOS_10(15, "10_cents", "10 centavos", "R$ 0,10 (Moeda)"),
+    CENTAVOS_25(16, "25_cents", "25 centavos", "R$ 0,25 (Moeda)"),
+    CENTAVOS_50(17, "50_cents", "50 centavos", "R$ 0,50 (Moeda)");
 
     companion object {
         private val byIndex = entries.associateBy { it.classIndex }
-        private val byLabel = entries.associateBy { it.modelLabel }
+        private val byLabel = entries.associateBy { it.modelLabel.lowercase(Locale.ROOT) }
 
         fun fromIndex(index: Int): BanknoteClass? = byIndex[index]
-        fun fromLabel(label: String): BanknoteClass? = byLabel[label.trim()]
+
+        /**
+         * Faz o mapeamento pelo `modelLabel` (ex: `20_reais_nova`) ou pelos nomes do dataset YOLO
+         * (`1 real`, `10 cents`, `10 reais`, `100 reais`, `2 reais`, `20 reais`, `200 reais`,
+         * `25 cents`, `5 cents`, `5 reais`, `50 cents`, `50 reais`).
+         */
+        fun fromLabel(label: String): BanknoteClass? {
+            val normalized = label.trim().lowercase(Locale.ROOT)
+            if (normalized.isEmpty()) return null
+            byLabel[normalized]?.let { return it }
+
+            val isCents = normalized.contains("cent")
+            val isOldFamily = normalized.contains("antiga") ||
+                normalized.contains("old") ||
+                normalized.contains("1a") ||
+                normalized.contains("f1")
+
+            val numberMatch = Regex("""(?:^|\D)(200|100|50|25|20|10|5|2|1)(?:\D|$)""").find(normalized)
+                ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: return null
+
+            if (isCents) {
+                return when (numberMatch) {
+                    5 -> CENTAVOS_5
+                    10 -> CENTAVOS_10
+                    25 -> CENTAVOS_25
+                    50 -> CENTAVOS_50
+                    else -> null
+                }
+            }
+
+            return when (numberMatch) {
+                1 -> REAL_1_ANTIGA
+                2 -> if (isOldFamily) REAIS_2_ANTIGA else REAIS_2_NOVA
+                5 -> if (isOldFamily) REAIS_5_ANTIGA else REAIS_5_NOVA
+                10 -> if (isOldFamily) REAIS_10_ANTIGA else REAIS_10_NOVA
+                20 -> if (isOldFamily) REAIS_20_ANTIGA else REAIS_20_NOVA
+                50 -> if (isOldFamily) REAIS_50_ANTIGA else REAIS_50_NOVA
+                100 -> if (isOldFamily) REAIS_100_ANTIGA else REAIS_100_NOVA
+                200 -> REAIS_200_NOVA
+                else -> null
+            }
+        }
     }
 }
 

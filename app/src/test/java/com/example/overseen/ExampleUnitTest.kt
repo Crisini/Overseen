@@ -65,12 +65,17 @@ class VisionCashUnitTests {
     }
 
     @Test
-    fun `RF03_2 todas as 14 classes de Real da 1a e 2a familias estao mapeadas corretamente`() {
-        assertEquals(14, BanknoteClass.entries.size)
+    fun `RF03_2 todas as classes de Real e moedas estao mapeadas corretamente`() {
+        assertEquals(18, BanknoteClass.entries.size)
         assertEquals(BanknoteClass.REAL_1_ANTIGA, BanknoteClass.fromLabel("1_real_antiga"))
         assertEquals(BanknoteClass.REAIS_20_NOVA, BanknoteClass.fromLabel("20_reais_nova"))
         assertEquals(BanknoteClass.REAIS_200_NOVA, BanknoteClass.fromLabel("200_reais_nova"))
+        assertEquals(BanknoteClass.CENTAVOS_5, BanknoteClass.fromLabel("5 cents"))
+        assertEquals(BanknoteClass.CENTAVOS_10, BanknoteClass.fromLabel("10 cents"))
+        assertEquals(BanknoteClass.CENTAVOS_25, BanknoteClass.fromLabel("25 cents"))
+        assertEquals(BanknoteClass.CENTAVOS_50, BanknoteClass.fromLabel("50 cents"))
         assertEquals("20 reais, nova", BanknoteClass.REAIS_20_NOVA.spokenText)
+        assertEquals("50 centavos", BanknoteClass.CENTAVOS_50.spokenText)
     }
 
     @Test

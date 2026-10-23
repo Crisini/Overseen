@@ -31,7 +31,7 @@ import kotlinx.coroutines.flow.update
  * Activity Principal do VisionCash & Light (RF01 a RF04):
  * - Abre diretamente na câmera traseira sem splash/onboarding que exija clique visual (RF01).
  * - Orquestra o pipeline de luminosidade (sensor de hardware + fallback YUV com histerese de 2s - RF02).
- * - Orquestra o detector TFLite quantizado INT8 com buffer de estabilidade de 2 frames e score >= 0.75 (RF03).
+ * - Orquestra o detector TFLite quantizado INT8 com buffer de estabilidade de 2 frames (RF03).
  * - Gerencia TTS conciso (`QUEUE_FLUSH`), feedback háptico diferencial e gestos de toque duplo e longo (RF04).
  */
 class MainActivity : ComponentActivity() {
@@ -42,7 +42,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var cameraController: CameraPipelineController
     private val confirmationBuffer = ConfirmationBuffer(
         requiredConsecutiveFrames = 2,
-        minConfidence = 0.75f
+        minConfidence = BanknoteDetector.MIN_CONFIDENCE_THRESHOLD
     )
 
     private val uiStateFlow = MutableStateFlow(VisionUiState())

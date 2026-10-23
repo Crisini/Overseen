@@ -1,14 +1,12 @@
-1_real_antiga
-2_reais_antiga
-5_reais_antiga
-10_reais_antiga
-20_reais_antiga
-50_reais_antiga
-100_reais_antiga
-2_reais_nova
-5_reais_nova
-10_reais_nova
-20_reais_nova
-50_reais_nova
-100_reais_nova
-200_reais_nova
+1 real
+10 cents
+10 reais
+100 reais
+2 reais
+20 reais
+200 reais
+25 cents
+5 cents
+5 reais
+50 cents
+50 reais
