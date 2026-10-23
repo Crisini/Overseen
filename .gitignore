@@ -13,3 +13,12 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Python / YOLOv8 training & datasets
+ml_training/
+dataset*/
+runs/
+.venv/
+__pycache__/
+*.pt
+*.onnx
